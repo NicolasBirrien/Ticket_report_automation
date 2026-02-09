@@ -1,0 +1,18 @@
+{
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+            "data/ExportData.xlsx",
+            "--year",
+            "2025",
+            "--alias",
+            "BIN"
+            ],
+        }
+    ],
+}

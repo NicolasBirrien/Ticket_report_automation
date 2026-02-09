@@ -55,10 +55,18 @@ def load_ticket_data(file_path: Path) -> pd.DataFrame:
 def calculate_resolution_times(
     tickets: pd.DataFrame,
     report_year: int,
+    report_start: pd.Timestamp | None = None,
+    report_end: pd.Timestamp | None = None,
     shutdowns: tuple[ShutdownWindow, ...] = DEFAULT_SHUTDOWNS,
 ) -> pd.DataFrame:
     shutdown_days = _build_shutdown_days(shutdowns)
-    mask = (tickets["Closed"].dt.year == report_year) & (tickets["Closed"].notna())
+    if report_start is not None and report_end is not None:
+        mask = (
+            tickets["Closed"].between(report_start, report_end)
+            & tickets["Closed"].notna()
+        )
+    else:
+        mask = (tickets["Closed"].dt.year == report_year) & (tickets["Closed"].notna())
     calc_df = tickets.loc[mask].copy()
 
     calc_df["Resolution_time_raw"] = (
@@ -66,18 +74,32 @@ def calculate_resolution_times(
     )
     calc_df["Total_Days"] = (calc_df["Closed"] - calc_df["Created"]).dt.days
 
-    start_arr = calc_df["Created"].values.astype("datetime64[D]")
-    end_arr = calc_df["Closed"].values.astype("datetime64[D]")
+    start_arr = calc_df["Created"].dt.normalize().values.astype("datetime64[D]")
+    end_arr = calc_df["Closed"].dt.normalize().values.astype("datetime64[D]")
 
-    working_days = np.busday_count(start_arr, end_arr, holidays=shutdown_days)
-    total_days = calc_df["Closed"].sub(calc_df["Created"]).dt.days
-    off_days = total_days - working_days
+    business_days = np.busday_count(
+        start_arr,
+        end_arr + np.timedelta64(1, "D"),
+        holidays=shutdown_days,
+    )
+    total_days = (end_arr - start_arr).astype("timedelta64[D]").astype(int) + 1
+    non_business_days = total_days - business_days
 
     calc_df["Resolution_time_real"] = (
-        calc_df["Resolution_time_raw"] - (off_days * 24)
+        calc_df["Resolution_time_raw"] - (non_business_days * 24)
     ).clip(lower=0)
 
     calc_df.attrs["shutdown_days"] = shutdown_days
+    if report_start is not None and report_end is not None:
+        shutdown_in_scope = shutdown_days[
+            (shutdown_days >= report_start.normalize())
+            & (shutdown_days <= report_end.normalize())
+        ]
+    else:
+        shutdown_in_scope = shutdown_days[
+            pd.to_datetime(shutdown_days).year == report_year
+        ]
+    calc_df.attrs["shutdown_days_in_scope"] = shutdown_in_scope
     return calc_df
 
 
@@ -96,10 +118,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Report year for closed tickets (default: 2025).",
     )
     parser.add_argument(
+        "--ytd",
+        action="store_true",
+        help="Use the last 365 days (year-to-date style) instead of a calendar year.",
+    )
+    parser.add_argument(
         "--output-report",
         type=Path,
         default=Path("report.html"),
         help="Output path for the one-page HTML report (default: report.html).",
+    )
+    parser.add_argument(
+        "--alias",
+        type=str,
+        help=(
+            "Filter to a specific responsible alias (e.g., BIN). "
+            "Matches against the Responsible column."
+        ),
     )
     return parser
 
@@ -258,7 +293,17 @@ def _build_report_charts(resolved: pd.DataFrame) -> list[tuple[str, str]]:
     return charts
 
 
-def build_html_report(resolved: pd.DataFrame, report_year: int, output_path: Path) -> None:
+def _filter_by_responsible_alias(tickets: pd.DataFrame, alias: str) -> pd.DataFrame:
+    if "Responsible" not in tickets.columns:
+        return tickets
+
+    alias = alias.strip().lower()
+    pattern = rf"\[{alias}\]"  # matches [bin]
+    mask = tickets["Responsible"].astype(str).str.lower().str.contains(pattern, na=False)
+    return tickets.loc[mask].copy()
+
+
+def build_html_report(resolved: pd.DataFrame, title: str, output_path: Path) -> None:
     median_hours = resolved["Resolution_time_real"].median()
     pct_90 = resolved["Resolution_time_real"].quantile(0.9)
     pct_10 = resolved["Resolution_time_real"].quantile(0.1)
@@ -266,7 +311,6 @@ def build_html_report(resolved: pd.DataFrame, report_year: int, output_path: Pat
     median_class = "kpi-good" if median_hours < 6 else ""
 
     charts = _build_report_charts(resolved)
-    title = f"Report technical support Bourdon {report_year}"
     submitter_column = _select_submitter_column(resolved)
     location_column = _select_location_column(resolved)
 
@@ -455,8 +499,25 @@ def main() -> None:
     args = parser.parse_args()
 
     tickets = load_ticket_data(args.file_path)
-    resolved = calculate_resolution_times(tickets, args.year)
+    if args.alias:
+        tickets = _filter_by_responsible_alias(tickets, args.alias)
+    report_start = None
+    report_end = None
+    if args.ytd:
+        report_end = pd.Timestamp.now()
+        report_start = report_end - pd.Timedelta(days=365)
+        report_label = f"YTD {report_end:%m/%d/%Y}"
+    else:
+        report_label = str(args.year)
+
+    resolved = calculate_resolution_times(
+        tickets,
+        args.year,
+        report_start=report_start,
+        report_end=report_end,
+    )
     shutdown_days = resolved.attrs.get("shutdown_days", np.array([]))
+    shutdown_days_in_scope = resolved.attrs.get("shutdown_days_in_scope", shutdown_days)
 
     preview_cols = [
         col
@@ -470,9 +531,14 @@ def main() -> None:
 
     avg_real = resolved["Resolution_time_real"].mean()
     print(f"\nAverage Global Resolution (Business Hours): {avg_real:.2f} hours")
-    print(f"Factory Shutdowns accounted for: {len(shutdown_days)} working days removed.")
+    print(
+        "Factory Shutdowns accounted for: "
+        f"{len(shutdown_days_in_scope)} working days removed."
+    )
 
-    build_html_report(resolved, args.year, args.output_report)
+    alias_label = f" - {args.alias.upper()}" if args.alias else ""
+    title = f"Report ticketing {alias_label} {report_label}"
+    build_html_report(resolved, title, args.output_report)
     print(f"Report written to {args.output_report.resolve()}")
 
 
